@@ -16,6 +16,9 @@ async def chat_with_agent(agent, runner, user_message: str, session_id=None):
     Returns:
         Tuple of (response_text, session)
     """
+    import asyncio
+    import re
+
     user_id = "student"
     app_name = runner.app_name
 
@@ -43,13 +46,32 @@ async def chat_with_agent(agent, runner, user_message: str, session_id=None):
         parts=[types.Part.from_text(text=user_message)],
     )
 
-    final_response = ""
-    async for event in runner.run_async(
-        user_id=user_id, session_id=session.id, new_message=content
-    ):
-        if hasattr(event, "content") and event.content and event.content.parts:
-            for part in event.content.parts:
-                if hasattr(part, "text") and part.text:
-                    final_response += part.text
+    for attempt in range(4):
+        try:
+            final_response = ""
+            async for event in runner.run_async(
+                user_id=user_id, session_id=session.id, new_message=content
+            ):
+                if hasattr(event, "content") and event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if hasattr(part, "text") and part.text:
+                            final_response += part.text
+            return final_response, session
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "Limit" in err_str:
+                sleep_time = 25.0
+                match = re.search(r"Please retry in (\d+(?:\.\d+)?)s", err_str)
+                if match:
+                    sleep_time = float(match.group(1)) + 1.0
+                elif "retryDelay" in err_str:
+                    match_delay = re.search(r"retryDelay':\s*'(\d+)s'", err_str)
+                    if match_delay:
+                        sleep_time = float(match_delay.group(1)) + 1.0
+                print(f"  [Rate limit hit in chat_with_agent, sleeping {sleep_time:.2f}s... attempt {attempt+1}/4]")
+                await asyncio.sleep(sleep_time)
+            else:
+                raise e
 
-    return final_response, session
+    raise RuntimeError("Max retries exceeded in chat_with_agent due to rate limiting")
+

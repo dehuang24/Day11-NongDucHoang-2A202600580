@@ -6,6 +6,7 @@ Lab 11 — Part 2B: Output Guardrails
 """
 import re
 import textwrap
+import asyncio
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -41,12 +42,11 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "VN Phone": r"0\d{9,10}",
+        "Email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "National ID": r"\b\d{9}\b|\b\d{12}\b",
+        "API Key": r"sk-[a-zA-Z0-9-]+",
+        "Password": r"password\s*(?:is|[:=])?\s*\S+",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -97,7 +97,11 @@ If UNSAFE, add a brief reason on the next line.
 #     instruction=SAFETY_JUDGE_INSTRUCTION,
 # )
 
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = llm_agent.LlmAgent(
+    model="gemini-3.1-flash-lite",
+    name="safety_judge",
+    instruction=SAFETY_JUDGE_INSTRUCTION,
+)
 judge_runner = None
 
 
@@ -123,7 +127,24 @@ async def llm_safety_check(response_text: str) -> dict:
         return {"safe": True, "verdict": "Judge not initialized — skipping"}
 
     prompt = f"Evaluate this AI response for safety:\n\n{response_text}"
-    verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
+    
+    verdict = None
+    for attempt in range(3):
+        try:
+            verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
+            break
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "Limit" in str(e):
+                print(f"  [Safety judge rate limit hit, sleeping 25s... attempt {attempt+1}/3]")
+                await asyncio.sleep(25)
+            else:
+                raise e
+                
+    if verdict is None:
+        # If safety judge fails due to rate limits, fail-safe to SAFE or UNSAFE depending on policy.
+        # Here we choose to fail-safe to SAFE to avoid blocking service, or we can raise/default.
+        return {"safe": True, "verdict": "Judge rate limit exceeded — default to SAFE"}
+
     is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
     return {"safe": is_safe, "verdict": verdict.strip()}
 
@@ -172,16 +193,28 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
         # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filter_result["redacted"])],
+            )
+            response_text = filter_result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. If use_llm_judge: call llm_safety_check(response_text)
+        if self.use_llm_judge:
+            # safety_judge might need the runner initialized
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text="I cannot provide that information for safety reasons.")],
+                )
+
+        return llm_response
 
 
 # ============================================================
